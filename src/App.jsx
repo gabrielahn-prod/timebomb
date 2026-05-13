@@ -1,19 +1,27 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlarmClock,
   Bath,
   Bus,
+  ChevronLeft,
   Clock3,
   GripVertical,
   Home,
+  Menu,
   Plus,
   RotateCcw,
+  Save,
   Sparkles,
   Train,
   Trash2,
+  X,
 } from 'lucide-react';
 import './styles.css';
+
+const ACTIVE_PROFILE_KEY = 'timebomb:active-profile-id:v1';
+const DEVICE_ID_KEY = 'timebomb:device-id:v1';
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
 const categories = [
   {
@@ -66,6 +74,14 @@ const starterPlan = [
   makeBlock('bus', '버스 평균 대기시간', 8),
 ];
 
+const defaultProfile = {
+  id: 'commute',
+  name: '출근',
+  plan: starterPlan,
+  targetTime: '09:00',
+  bufferMinutes: 10,
+};
+
 function makeBlock(categoryId, label, minutes = 5) {
   return {
     id: `${categoryId}-${label}-${crypto.randomUUID()}`,
@@ -100,11 +116,160 @@ function formatClock(minutes) {
   return `${hours}:${rest}`;
 }
 
+function getDeviceId() {
+  const existing = localStorage.getItem(DEVICE_ID_KEY);
+  if (existing) return existing;
+  const next = `device-${crypto.randomUUID().slice(0, 8)}`;
+  localStorage.setItem(DEVICE_ID_KEY, next);
+  return next;
+}
+
+function makeProfile(name = '새 일정') {
+  const id = `profile-${crypto.randomUUID().slice(0, 8)}`;
+  return {
+    ...defaultProfile,
+    id,
+    name,
+    plan: [],
+    isNew: true,
+  };
+}
+
+function normalizeProfile(profile) {
+  return {
+    id: profile.id,
+    name: profile.name,
+    plan: Array.isArray(profile.plan) ? profile.plan : [],
+    targetTime: profile.target_time ?? profile.targetTime ?? '09:00',
+    bufferMinutes: profile.buffer_minutes ?? profile.bufferMinutes ?? 10,
+    isNew: false,
+  };
+}
+
+function serializeProfile(profile) {
+  return {
+    name: profile.name || '새 일정',
+    target_time: profile.targetTime || '09:00',
+    buffer_minutes: Math.max(0, Math.min(240, Number(profile.bufferMinutes) || 0)),
+    plan: Array.isArray(profile.plan) ? profile.plan : [],
+  };
+}
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(`${API_URL}${path}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+    ...options,
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `API request failed: ${response.status}`);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+}
+
 function App() {
-  const [plan, setPlan] = useState(starterPlan);
+  const [deviceId] = useState(getDeviceId);
+  const [profiles, setProfiles] = useState([defaultProfile]);
+  const [activeProfileId, setActiveProfileId] = useState(
+    () => localStorage.getItem(ACTIVE_PROFILE_KEY) || defaultProfile.id,
+  );
+  const [saveState, setSaveState] = useState('불러오는 중');
   const [draggedId, setDraggedId] = useState(null);
-  const [targetTime, setTargetTime] = useState('09:00');
-  const [bufferMinutes, setBufferMinutes] = useState(10);
+  const [routeForm, setRouteForm] = useState({
+    startLng: '',
+    startLat: '',
+    endLng: '',
+    endLat: '',
+  });
+  const [routeState, setRouteState] = useState('좌표 입력');
+  const [routeOptions, setRouteOptions] = useState([]);
+  const [isMobilePaletteOpen, setIsMobilePaletteOpen] = useState(false);
+  const [mobileCategoryId, setMobileCategoryId] = useState(null);
+
+  const activeProfile = profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0];
+  const plan = activeProfile?.plan ?? [];
+  const targetTime = activeProfile?.targetTime ?? '09:00';
+  const bufferMinutes = activeProfile?.bufferMinutes ?? 10;
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadSchedules() {
+      setSaveState('불러오는 중');
+      try {
+        const schedules = await apiRequest(`/api/devices/${encodeURIComponent(deviceId)}/schedules`);
+        if (ignore) return;
+        const nextProfiles = schedules.map(normalizeProfile);
+        setProfiles(nextProfiles.length > 0 ? nextProfiles : [defaultProfile]);
+        const savedActiveId = localStorage.getItem(ACTIVE_PROFILE_KEY);
+        const nextActive =
+          nextProfiles.find((profile) => profile.id === savedActiveId)?.id ?? nextProfiles[0]?.id;
+        setActiveProfileId(nextActive ?? defaultProfile.id);
+        setSaveState('저장됨');
+      } catch {
+        if (!ignore) setSaveState('서버 연결 필요');
+      }
+    }
+
+    loadSchedules();
+
+    return () => {
+      ignore = true;
+    };
+  }, [deviceId]);
+
+  useEffect(() => {
+    if (activeProfile?.id) {
+      localStorage.setItem(ACTIVE_PROFILE_KEY, activeProfile.id);
+    }
+  }, [activeProfile?.id]);
+
+  const persistProfile = async (profile = activeProfile) => {
+    if (!profile) return;
+    const trimmedName = profile.name.trim();
+    if (!trimmedName) {
+      setSaveState('제목 필요');
+      return;
+    }
+    setSaveState('저장 중');
+    try {
+      const payload = serializeProfile({ ...profile, name: trimmedName });
+      const saved = profile.isNew
+        ? await apiRequest(`/api/devices/${encodeURIComponent(deviceId)}/schedules`, {
+            method: 'POST',
+            body: JSON.stringify({ id: profile.id, ...payload }),
+          })
+        : await apiRequest(
+            `/api/devices/${encodeURIComponent(deviceId)}/schedules/${encodeURIComponent(profile.id)}`,
+            {
+              method: 'PUT',
+              body: JSON.stringify(payload),
+            },
+          );
+      const savedProfile = normalizeProfile(saved);
+      setProfiles((current) =>
+        current.map((item) => (item.id === savedProfile.id ? savedProfile : item)),
+      );
+      setSaveState('저장됨');
+    } catch {
+      setSaveState('저장 실패');
+    }
+  };
+
+  const updateActiveProfile = (updates) => {
+    if (!activeProfile) return;
+    const nextProfile = { ...activeProfile, ...updates };
+    setProfiles((current) =>
+      current.map((profile) =>
+        profile.id === activeProfile.id ? nextProfile : profile,
+      ),
+    );
+    setSaveState('저장 안 됨');
+  };
 
   const totalMinutes = useMemo(
     () => plan.reduce((sum, block) => sum + (Number(block.minutes) || 0), 0),
@@ -123,35 +288,113 @@ function App() {
   }, [bufferMinutes, targetTime, totalMinutes]);
 
   const addBlock = (categoryId, label) => {
-    setPlan((current) => [...current, makeBlock(categoryId, label)]);
+    updateActiveProfile({ plan: [...plan, makeBlock(categoryId, label)] });
+    setIsMobilePaletteOpen(false);
+    setMobileCategoryId(null);
+  };
+
+  const insertBlocks = (blocks) => {
+    if (!blocks.length) return;
+    const nextBlocks = blocks.map((block) => ({
+      ...block,
+      id: `${block.id}-${crypto.randomUUID()}`,
+    }));
+    updateActiveProfile({ plan: [...plan, ...nextBlocks] });
   };
 
   const updateMinutes = (id, minutes) => {
-    setPlan((current) =>
-      current.map((block) =>
+    updateActiveProfile({
+      plan: plan.map((block) =>
         block.id === id
           ? { ...block, minutes: Math.max(0, Math.min(999, Number(minutes) || 0)) }
           : block,
       ),
-    );
+    });
   };
 
   const removeBlock = (id) => {
-    setPlan((current) => current.filter((block) => block.id !== id));
+    updateActiveProfile({ plan: plan.filter((block) => block.id !== id) });
   };
 
   const moveBlock = (targetId) => {
     if (!draggedId || draggedId === targetId) return;
-    setPlan((current) => {
-      const draggedIndex = current.findIndex((block) => block.id === draggedId);
-      const targetIndex = current.findIndex((block) => block.id === targetId);
-      if (draggedIndex < 0 || targetIndex < 0) return current;
-      const next = [...current];
-      const [dragged] = next.splice(draggedIndex, 1);
-      next.splice(targetIndex, 0, dragged);
-      return next;
-    });
+    const draggedIndex = plan.findIndex((block) => block.id === draggedId);
+    const targetIndex = plan.findIndex((block) => block.id === targetId);
+    if (draggedIndex < 0 || targetIndex < 0) return;
+    const next = [...plan];
+    const [dragged] = next.splice(draggedIndex, 1);
+    next.splice(targetIndex, 0, dragged);
+    updateActiveProfile({ plan: next });
   };
+
+  const addProfile = () => {
+    const next = makeProfile();
+    setProfiles((current) => [...current, next]);
+    setActiveProfileId(next.id);
+    setSaveState('저장 안 됨');
+  };
+
+  const updateRouteField = (field, value) => {
+    setRouteForm((current) => ({ ...current, [field]: value }));
+  };
+
+  const fetchTransitRoute = async () => {
+    if (Object.values(routeForm).some((value) => !value.trim())) {
+      setRouteState('좌표 확인 필요');
+      return;
+    }
+    const payload = {
+      start_lng: Number(routeForm.startLng),
+      start_lat: Number(routeForm.startLat),
+      end_lng: Number(routeForm.endLng),
+      end_lat: Number(routeForm.endLat),
+      search_path_type: 0,
+    };
+    if (Object.values(payload).some((value) => Number.isNaN(value))) {
+      setRouteState('좌표 확인 필요');
+      return;
+    }
+    setRouteState('조회 중');
+    try {
+      const result = await apiRequest('/api/transit/estimate', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setRouteOptions(result.routes ?? []);
+      setRouteState((result.routes ?? []).length ? '경로 선택' : '경로 없음');
+    } catch {
+      setRouteOptions([]);
+      setRouteState('조회 실패');
+    }
+  };
+
+  const removeProfile = async () => {
+    if (!activeProfile) return;
+    if (activeProfile.isNew) {
+      const nextProfiles = profiles.filter((profile) => profile.id !== activeProfile.id);
+      const fallbackProfile = makeProfile();
+      setProfiles(nextProfiles.length > 0 ? nextProfiles : [fallbackProfile]);
+      setActiveProfileId(nextProfiles[0]?.id ?? fallbackProfile.id);
+      setSaveState('저장 안 됨');
+      return;
+    }
+    setSaveState('삭제 중');
+    try {
+      await apiRequest(
+        `/api/devices/${encodeURIComponent(deviceId)}/schedules/${encodeURIComponent(activeProfile.id)}`,
+        { method: 'DELETE' },
+      );
+      const nextProfiles = profiles.filter((profile) => profile.id !== activeProfile.id);
+      const fallbackProfile = makeProfile();
+      setProfiles(nextProfiles.length > 0 ? nextProfiles : [fallbackProfile]);
+      setActiveProfileId(nextProfiles[0]?.id ?? fallbackProfile.id);
+      setSaveState(nextProfiles.length > 0 ? '저장됨' : '저장 안 됨');
+    } catch {
+      setSaveState('삭제 실패');
+    }
+  };
+
+  const mobileCategory = categories.find((category) => category.id === mobileCategoryId);
 
   return (
     <main className="app">
@@ -198,12 +441,49 @@ function App() {
         <section className="builder" aria-label="시간 계산 빌더">
           <div className="builder-header">
             <div>
-              <p className="eyebrow">블록을 눌러 추가하고 시간을 입력하세요</p>
-              <h2>출발 전 루틴</h2>
+              <p className="eyebrow">블록을 눌러 추가하고 시간을 입력하세요 · {saveState}</p>
+              <h2>{activeProfile?.name ?? '출근'}</h2>
             </div>
-            <button className="icon-button" aria-label="초기화" onClick={() => setPlan([])}>
-              <RotateCcw size={20} />
-            </button>
+            <div className="schedule-controls" aria-label="일정 관리">
+              <input
+                aria-label="일정 제목"
+                placeholder="일정 제목"
+                value={activeProfile?.name ?? ''}
+                onChange={(event) => updateActiveProfile({ name: event.target.value })}
+              />
+              <button className="text-button" onClick={() => persistProfile()}>
+                <Save size={18} />
+                <span>저장하기</span>
+              </button>
+              <button className="text-button" onClick={removeProfile}>
+                <Trash2 size={18} />
+                <span>삭제하기</span>
+              </button>
+              <button className="icon-button" aria-label="새 일정" onClick={addProfile}>
+                <Plus size={20} />
+              </button>
+              <button
+                className="icon-button"
+                aria-label="초기화"
+                onClick={() => updateActiveProfile({ plan: [] })}
+              >
+                <RotateCcw size={20} />
+              </button>
+            </div>
+          </div>
+
+          <div className="schedule-list" aria-label="저장된 일정">
+            {profiles.map((profile) => (
+              <button
+                className={`schedule-chip ${profile.id === activeProfile?.id ? 'is-active' : ''}`}
+                key={profile.id}
+                type="button"
+                onClick={() => setActiveProfileId(profile.id)}
+              >
+                <strong>{profile.name || '제목 없음'}</strong>
+                <span>{profile.plan?.length ?? 0}개 블록</span>
+              </button>
+            ))}
           </div>
 
           <div className="timeline">
@@ -260,6 +540,70 @@ function App() {
         </section>
 
         <aside className="summary" aria-label="총 시간">
+          <div className="route-panel">
+            <div className="alarm-title">
+              <Train size={19} />
+              <span>경로 가져오기</span>
+            </div>
+            <div className="coord-grid">
+              <label className="time-field">
+                <span>출발 경도</span>
+                <input
+                  inputMode="decimal"
+                  placeholder="126.9784"
+                  value={routeForm.startLng}
+                  onChange={(event) => updateRouteField('startLng', event.target.value)}
+                />
+              </label>
+              <label className="time-field">
+                <span>출발 위도</span>
+                <input
+                  inputMode="decimal"
+                  placeholder="37.5665"
+                  value={routeForm.startLat}
+                  onChange={(event) => updateRouteField('startLat', event.target.value)}
+                />
+              </label>
+              <label className="time-field">
+                <span>도착 경도</span>
+                <input
+                  inputMode="decimal"
+                  placeholder="127.0276"
+                  value={routeForm.endLng}
+                  onChange={(event) => updateRouteField('endLng', event.target.value)}
+                />
+              </label>
+              <label className="time-field">
+                <span>도착 위도</span>
+                <input
+                  inputMode="decimal"
+                  placeholder="37.4979"
+                  value={routeForm.endLat}
+                  onChange={(event) => updateRouteField('endLat', event.target.value)}
+                />
+              </label>
+            </div>
+            <button className="wide-button" type="button" onClick={fetchTransitRoute}>
+              경로 조회
+            </button>
+            <p className="route-state">{routeState}</p>
+            {routeOptions.length > 0 && (
+              <div className="route-options">
+                {routeOptions.map((route, index) => (
+                  <button
+                    className="route-option"
+                    type="button"
+                    key={`${route.title}-${index}`}
+                    onClick={() => insertBlocks(route.blocks ?? [])}
+                  >
+                    <strong>{route.total_minutes}분</strong>
+                    <span>{route.blocks?.length ?? 0}개 블록으로 끼워 넣기</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="alarm-panel">
             <div className="alarm-title">
               <AlarmClock size={19} />
@@ -270,7 +614,7 @@ function App() {
               <input
                 type="time"
                 value={targetTime}
-                onChange={(event) => setTargetTime(event.target.value)}
+                onChange={(event) => updateActiveProfile({ targetTime: event.target.value })}
               />
             </label>
             <label className="time-field">
@@ -282,7 +626,9 @@ function App() {
                   max="240"
                   value={bufferMinutes}
                   onChange={(event) =>
-                    setBufferMinutes(Math.max(0, Math.min(240, Number(event.target.value) || 0)))
+                    updateActiveProfile({
+                      bufferMinutes: Math.max(0, Math.min(240, Number(event.target.value) || 0)),
+                    })
                   }
                 />
                 <span>분</span>
@@ -315,6 +661,97 @@ function App() {
           </div>
         </aside>
       </section>
+
+      <button
+        className="mobile-palette-button"
+        type="button"
+        aria-label="블록 메뉴 열기"
+        onClick={() => setIsMobilePaletteOpen(true)}
+      >
+        <Menu size={22} />
+        <span>블록</span>
+      </button>
+
+      {isMobilePaletteOpen && (
+        <div className="mobile-palette-shell" role="dialog" aria-modal="true">
+          <button
+            className="mobile-palette-backdrop"
+            type="button"
+            aria-label="블록 메뉴 닫기"
+            onClick={() => {
+              setIsMobilePaletteOpen(false);
+              setMobileCategoryId(null);
+            }}
+          />
+          <section className="mobile-palette-sheet" aria-label="모바일 블록 메뉴">
+            <div className="mobile-sheet-header">
+              {mobileCategory ? (
+                <button
+                  className="sheet-icon-button"
+                  type="button"
+                  aria-label="카테고리로 돌아가기"
+                  onClick={() => setMobileCategoryId(null)}
+                >
+                  <ChevronLeft size={22} />
+                </button>
+              ) : (
+                <div className="sheet-spacer" />
+              )}
+              <strong>{mobileCategory?.name ?? '블록 선택'}</strong>
+              <button
+                className="sheet-icon-button"
+                type="button"
+                aria-label="블록 메뉴 닫기"
+                onClick={() => {
+                  setIsMobilePaletteOpen(false);
+                  setMobileCategoryId(null);
+                }}
+              >
+                <X size={22} />
+              </button>
+            </div>
+
+            {mobileCategory ? (
+              <div className="mobile-block-list">
+                {mobileCategory.blocks.map((label) => (
+                  <button
+                    className="palette-block"
+                    key={label}
+                    style={{
+                      '--block-color': mobileCategory.color,
+                      '--block-soft': mobileCategory.soft,
+                    }}
+                    type="button"
+                    onClick={() => addBlock(mobileCategory.id, label)}
+                  >
+                    <Plus size={15} />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="mobile-category-list">
+                {categories.map((category) => {
+                  const Icon = category.icon;
+                  return (
+                    <button
+                      className="mobile-category-button"
+                      key={category.id}
+                      type="button"
+                      style={{ '--block-color': category.color, '--block-soft': category.soft }}
+                      onClick={() => setMobileCategoryId(category.id)}
+                    >
+                      <Icon size={20} />
+                      <span>{category.name}</span>
+                      <strong>{category.blocks.length}</strong>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </main>
   );
 }
