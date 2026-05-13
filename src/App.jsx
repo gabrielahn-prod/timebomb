@@ -8,10 +8,12 @@ import {
   Clock3,
   GripVertical,
   Home,
+  LocateFixed,
   Menu,
   Plus,
   RotateCcw,
   Save,
+  Search,
   Sparkles,
   Train,
   Trash2,
@@ -180,12 +182,14 @@ function App() {
   const [saveState, setSaveState] = useState('불러오는 중');
   const [draggedId, setDraggedId] = useState(null);
   const [routeForm, setRouteForm] = useState({
-    startLng: '',
-    startLat: '',
-    endLng: '',
-    endLat: '',
+    startQuery: '',
+    endQuery: '',
   });
-  const [routeState, setRouteState] = useState('좌표 입력');
+  const [startPlace, setStartPlace] = useState(null);
+  const [endPlace, setEndPlace] = useState(null);
+  const [startResults, setStartResults] = useState([]);
+  const [endResults, setEndResults] = useState([]);
+  const [routeState, setRouteState] = useState('장소 입력');
   const [routeOptions, setRouteOptions] = useState([]);
   const [isMobilePaletteOpen, setIsMobilePaletteOpen] = useState(false);
   const [mobileCategoryId, setMobileCategoryId] = useState(null);
@@ -338,16 +342,83 @@ function App() {
     setRouteForm((current) => ({ ...current, [field]: value }));
   };
 
+  const currentSearchPoint = startPlace
+    ? `&lng=${encodeURIComponent(startPlace.lng)}&lat=${encodeURIComponent(startPlace.lat)}`
+    : '';
+
+  const searchPlaces = async (kind) => {
+    const query = (kind === 'start' ? routeForm.startQuery : routeForm.endQuery).trim();
+    if (!query) {
+      setRouteState('검색어 필요');
+      return;
+    }
+    setRouteState('장소 검색 중');
+    try {
+      const result = await apiRequest(
+        `/api/places/search?query=${encodeURIComponent(query)}${kind === 'end' ? currentSearchPoint : ''}`,
+      );
+      if (kind === 'start') {
+        setStartResults(result.places ?? []);
+      } else {
+        setEndResults(result.places ?? []);
+      }
+      setRouteState((result.places ?? []).length ? '장소 선택' : '검색 결과 없음');
+    } catch {
+      setRouteState('장소 검색 실패');
+    }
+  };
+
+  const selectPlace = (kind, place) => {
+    if (kind === 'start') {
+      setStartPlace(place);
+      setStartResults([]);
+      setRouteForm((current) => ({ ...current, startQuery: place.name }));
+    } else {
+      setEndPlace(place);
+      setEndResults([]);
+      setRouteForm((current) => ({ ...current, endQuery: place.name }));
+    }
+    setRouteOptions([]);
+    setRouteState('경로 조회 가능');
+  };
+
+  const useCurrentLocation = () => {
+    if (!navigator.geolocation) {
+      setRouteState('현재 위치 불가');
+      return;
+    }
+    setRouteState('현재 위치 확인 중');
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const place = {
+          id: 'current-location',
+          name: '현재 위치',
+          address: '브라우저 위치',
+          road_address: '',
+          category: 'GPS',
+          lng: position.coords.longitude,
+          lat: position.coords.latitude,
+        };
+        setStartPlace(place);
+        setStartResults([]);
+        setRouteForm((current) => ({ ...current, startQuery: '현재 위치' }));
+        setRouteState('도착지 선택');
+      },
+      () => setRouteState('위치 권한 필요'),
+      { enableHighAccuracy: true, timeout: 8000 },
+    );
+  };
+
   const fetchTransitRoute = async () => {
-    if (Object.values(routeForm).some((value) => !value.trim())) {
-      setRouteState('좌표 확인 필요');
+    if (!startPlace || !endPlace) {
+      setRouteState('출발/도착 선택 필요');
       return;
     }
     const payload = {
-      start_lng: Number(routeForm.startLng),
-      start_lat: Number(routeForm.startLat),
-      end_lng: Number(routeForm.endLng),
-      end_lat: Number(routeForm.endLat),
+      start_lng: Number(startPlace.lng),
+      start_lat: Number(startPlace.lat),
+      end_lng: Number(endPlace.lng),
+      end_lat: Number(endPlace.lat),
       search_path_type: 0,
     };
     if (Object.values(payload).some((value) => Number.isNaN(value))) {
@@ -360,8 +431,16 @@ function App() {
         method: 'POST',
         body: JSON.stringify(payload),
       });
-      setRouteOptions(result.routes ?? []);
-      setRouteState((result.routes ?? []).length ? '경로 선택' : '경로 없음');
+      const routes = result.routes ?? [];
+      const shortestRoute = routes[0];
+      if (!shortestRoute) {
+        setRouteOptions([]);
+        setRouteState('경로 없음');
+        return;
+      }
+      insertBlocks(shortestRoute.blocks ?? []);
+      setRouteOptions(routes.slice(1));
+      setRouteState(`${shortestRoute.total_minutes}분 최단 경로 추가됨`);
     } catch {
       setRouteOptions([]);
       setRouteState('조회 실패');
@@ -545,46 +624,70 @@ function App() {
               <Train size={19} />
               <span>경로 가져오기</span>
             </div>
-            <div className="coord-grid">
+            <button className="wide-button secondary" type="button" onClick={useCurrentLocation}>
+              <LocateFixed size={18} />
+              현재 위치로 출발
+            </button>
+            <div className="place-search">
               <label className="time-field">
-                <span>출발 경도</span>
-                <input
-                  inputMode="decimal"
-                  placeholder="126.9784"
-                  value={routeForm.startLng}
-                  onChange={(event) => updateRouteField('startLng', event.target.value)}
-                />
+                <span>출발지</span>
+                <div className="search-row">
+                  <input
+                    placeholder="예: 홍대입구역"
+                    value={routeForm.startQuery}
+                    onChange={(event) => {
+                      updateRouteField('startQuery', event.target.value);
+                      setStartPlace(null);
+                    }}
+                  />
+                  <button type="button" onClick={() => searchPlaces('start')}>
+                    <Search size={18} />
+                  </button>
+                </div>
               </label>
+              {startPlace && <p className="selected-place">출발: {startPlace.name}</p>}
+              {startResults.length > 0 && (
+                <div className="place-results">
+                  {startResults.map((place) => (
+                    <button type="button" key={place.id} onClick={() => selectPlace('start', place)}>
+                      <strong>{place.name}</strong>
+                      <span>{place.road_address || place.address || place.category}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="place-search">
               <label className="time-field">
-                <span>출발 위도</span>
-                <input
-                  inputMode="decimal"
-                  placeholder="37.5665"
-                  value={routeForm.startLat}
-                  onChange={(event) => updateRouteField('startLat', event.target.value)}
-                />
+                <span>도착지</span>
+                <div className="search-row">
+                  <input
+                    placeholder="예: 강남역"
+                    value={routeForm.endQuery}
+                    onChange={(event) => {
+                      updateRouteField('endQuery', event.target.value);
+                      setEndPlace(null);
+                    }}
+                  />
+                  <button type="button" onClick={() => searchPlaces('end')}>
+                    <Search size={18} />
+                  </button>
+                </div>
               </label>
-              <label className="time-field">
-                <span>도착 경도</span>
-                <input
-                  inputMode="decimal"
-                  placeholder="127.0276"
-                  value={routeForm.endLng}
-                  onChange={(event) => updateRouteField('endLng', event.target.value)}
-                />
-              </label>
-              <label className="time-field">
-                <span>도착 위도</span>
-                <input
-                  inputMode="decimal"
-                  placeholder="37.4979"
-                  value={routeForm.endLat}
-                  onChange={(event) => updateRouteField('endLat', event.target.value)}
-                />
-              </label>
+              {endPlace && <p className="selected-place">도착: {endPlace.name}</p>}
+              {endResults.length > 0 && (
+                <div className="place-results">
+                  {endResults.map((place) => (
+                    <button type="button" key={place.id} onClick={() => selectPlace('end', place)}>
+                      <strong>{place.name}</strong>
+                      <span>{place.road_address || place.address || place.category}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
             <button className="wide-button" type="button" onClick={fetchTransitRoute}>
-              경로 조회
+              최단 경로 보드에 추가
             </button>
             <p className="route-state">{routeState}</p>
             {routeOptions.length > 0 && (
@@ -597,7 +700,7 @@ function App() {
                     onClick={() => insertBlocks(route.blocks ?? [])}
                   >
                     <strong>{route.total_minutes}분</strong>
-                    <span>{route.blocks?.length ?? 0}개 블록으로 끼워 넣기</span>
+                    <span>대안 경로 {index + 2} · {route.blocks?.length ?? 0}개 블록 추가</span>
                   </button>
                 ))}
               </div>

@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -35,6 +35,7 @@ STARTER_PLAN = [
 ]
 
 ODSAY_ROUTE_URL = "https://api.odsay.com/v1/api/searchPubTransPathT"
+KAKAO_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 
 
 class TransitEstimateRequest(BaseModel):
@@ -55,6 +56,20 @@ class TransitRouteOut(BaseModel):
 
 class TransitEstimateOut(BaseModel):
     routes: list[TransitRouteOut]
+
+
+class PlaceOut(BaseModel):
+    id: str
+    name: str
+    address: str
+    road_address: str
+    category: str
+    lng: float
+    lat: float
+
+
+class PlaceSearchOut(BaseModel):
+    places: list[PlaceOut]
 
 
 @app.get("/health")
@@ -91,29 +106,67 @@ def segment_label(segment: dict, fallback: str) -> str:
     return " · ".join(map(str, pieces)) or fallback
 
 
-def segment_to_block(segment: dict, index: int) -> dict | None:
-    section_minutes = minutes(segment.get("sectionTime"))
-    if section_minutes <= 0:
-        return None
+def wait_minutes(segment: dict) -> int:
+    for key in ("waitTime", "waitingTime", "arrivalTime", "startWaitTime"):
+        if key in segment:
+            return minutes(segment.get(key))
+    return 0
 
+
+def transit_kind(segment: dict) -> tuple[str, str, str]:
     traffic_type = segment.get("trafficType")
     if traffic_type == 1:
-        category_id = "subway"
-        fallback = "지하철 탑승 시간"
-    elif traffic_type == 2:
-        category_id = "bus"
-        fallback = "버스 탑승 시간"
-    else:
-        category_id = "inside"
-        fallback = "도보 이동" if index == 0 else "환승 이동"
+        return "subway", "지하철 대기시간", "지하철 탑승 시간"
+    if traffic_type == 2:
+        return "bus", "버스 대기시간", "버스 탑승 시간"
+    return "inside", "", ""
 
-    return {
-        "id": f"transit-{uuid4().hex[:8]}",
-        "categoryId": category_id,
-        "label": segment_label(segment, fallback),
-        "minutes": section_minutes,
-        "source": "odsay",
-    }
+
+def segment_to_blocks(segment: dict, index: int) -> list[dict]:
+    section_minutes = minutes(segment.get("sectionTime"))
+    if section_minutes <= 0:
+        return []
+
+    traffic_type = segment.get("trafficType")
+    if traffic_type in (1, 2):
+        category_id, wait_label, ride_label = transit_kind(segment)
+        blocks = []
+        segment_wait_minutes = wait_minutes(segment)
+        if segment_wait_minutes > 0:
+            blocks.append(
+                {
+                    "id": f"transit-wait-{uuid4().hex[:8]}",
+                    "categoryId": category_id,
+                    "label": segment_label(segment, wait_label).replace(" · ", " 대기 · ", 1),
+                    "minutes": segment_wait_minutes,
+                    "source": "odsay",
+                    "sourceType": "wait",
+                }
+            )
+        blocks.append(
+            {
+                "id": f"transit-ride-{uuid4().hex[:8]}",
+                "categoryId": category_id,
+                "label": segment_label(segment, ride_label),
+                "minutes": section_minutes,
+                "source": "odsay",
+                "sourceType": "ride",
+            }
+        )
+        return blocks
+
+    fallback = "역까지 이동" if index == 0 else "환승 이동"
+
+    return [
+        {
+            "id": f"transit-walk-{uuid4().hex[:8]}",
+            "categoryId": "inside",
+            "label": segment_label(segment, fallback),
+            "minutes": section_minutes,
+            "source": "odsay",
+            "sourceType": "walk",
+        }
+    ]
 
 
 def path_to_route(path: dict, route_index: int) -> TransitRouteOut:
@@ -122,7 +175,7 @@ def path_to_route(path: dict, route_index: int) -> TransitRouteOut:
     blocks = [
         block
         for index, segment in enumerate(subpaths)
-        if (block := segment_to_block(segment, index))
+        for block in segment_to_blocks(segment, index)
     ]
     total_minutes = minutes(info.get("totalTime")) or sum(block["minutes"] for block in blocks)
     title = info.get("mapObj") or f"추천 경로 {route_index + 1}"
@@ -153,8 +206,11 @@ async def estimate_transit(payload: TransitEstimateRequest):
     }
 
     try:
+        headers = {}
+        if referer := os.getenv("ODSAY_REFERER"):
+            headers["Referer"] = referer
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(ODSAY_ROUTE_URL, params=params)
+            response = await client.get(ODSAY_ROUTE_URL, params=params, headers=headers)
             response.raise_for_status()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"ODsay request failed: {exc}") from exc
@@ -164,8 +220,56 @@ async def estimate_transit(payload: TransitEstimateRequest):
         raise HTTPException(status_code=502, detail=data["error"])
 
     paths = data.get("result", {}).get("path") or []
-    routes = [path_to_route(path, index) for index, path in enumerate(paths[:3])]
+    routes = sorted(
+        [path_to_route(path, index) for index, path in enumerate(paths)],
+        key=lambda route: route.total_minutes,
+    )[:3]
     return TransitEstimateOut(routes=routes)
+
+
+@app.get("/api/places/search", response_model=PlaceSearchOut)
+async def search_places(
+    query: str = Query(..., min_length=1),
+    lng: float | None = None,
+    lat: float | None = None,
+):
+    api_key = os.getenv("KAKAO_REST_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY is not configured")
+
+    params = {
+        "query": query,
+        "size": 8,
+    }
+    if lng is not None and lat is not None:
+        params.update({"x": lng, "y": lat, "sort": "distance"})
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(
+                KAKAO_KEYWORD_URL,
+                params=params,
+                headers={"Authorization": f"KakaoAK {api_key}"},
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Kakao place search failed: {exc}") from exc
+
+    data = response.json()
+    places = [
+        PlaceOut(
+            id=item.get("id") or f"kakao-{index}",
+            name=item.get("place_name") or query,
+            address=item.get("address_name") or "",
+            road_address=item.get("road_address_name") or "",
+            category=item.get("category_group_name") or item.get("category_name") or "",
+            lng=float(item["x"]),
+            lat=float(item["y"]),
+        )
+        for index, item in enumerate(data.get("documents", []))
+        if item.get("x") and item.get("y")
+    ]
+    return PlaceSearchOut(places=places)
 
 
 def get_or_create_device(db: Session, device_id: str) -> Device:
