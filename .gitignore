@@ -4,6 +4,7 @@ dist/
 backend/.venv/
 backend/.env
 backend/data/
+.deploy/
 __pycache__/
 .pytest_cache/
 .DS_Store
