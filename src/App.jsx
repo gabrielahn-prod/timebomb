@@ -19,6 +19,8 @@ import {
   RotateCcw,
   Save,
   Search,
+  Download,
+  Share2,
   Sparkles,
   Smartphone,
   Train,
@@ -125,6 +127,10 @@ function formatDuration(minutes) {
   return `${h}시간 ${m}분`;
 }
 
+function normalizeMinutes(minutes, max = 999) {
+  return Math.max(0, Math.min(max, Number(minutes) || 0));
+}
+
 function parseTimeToMinutes(time) {
   const [h = '0', m = '0'] = time.split(':');
   return Number(h) * 60 + Number(m);
@@ -136,6 +142,15 @@ function formatClock(minutes) {
   const h = String(Math.floor(norm / 60)).padStart(2, '0');
   const m = String(norm % 60).padStart(2, '0');
   return `${h}:${m}`;
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Failed to create image'));
+    }, 'image/png', 0.96);
+  });
 }
 
 function formatDateTime(value) {
@@ -176,7 +191,9 @@ function normalizeProfile(profile) {
   return {
     id: profile.id,
     name: profile.name,
-    plan: Array.isArray(profile.plan) ? profile.plan : [],
+    plan: Array.isArray(profile.plan)
+      ? profile.plan.map((block) => ({ ...block, minutes: normalizeMinutes(block.minutes) }))
+      : [],
     targetTime: profile.target_time ?? profile.targetTime ?? '09:00',
     bufferMinutes: profile.buffer_minutes ?? profile.bufferMinutes ?? 10,
     isNew: false,
@@ -187,8 +204,10 @@ function serializeProfile(profile) {
   return {
     name: profile.name || '새 일정',
     target_time: profile.targetTime || '09:00',
-    buffer_minutes: Math.max(0, Math.min(240, Number(profile.bufferMinutes) || 0)),
-    plan: Array.isArray(profile.plan) ? profile.plan : [],
+    buffer_minutes: normalizeMinutes(profile.bufferMinutes, 240),
+    plan: Array.isArray(profile.plan)
+      ? profile.plan.map((block) => ({ ...block, minutes: normalizeMinutes(block.minutes) }))
+      : [],
   };
 }
 
@@ -237,9 +256,14 @@ function loadKakaoMapSdk() {
 function KakaoPlacePickerMap({
   startPlace,
   endPlace,
+  searchResults = [],
+  searchResultTarget,
+  searchQuery,
   routeMode,
   activePinTarget,
   onActivePinTargetChange,
+  onSearchQueryChange,
+  onSearch,
   onPickPlace,
 }) {
   const mapNodeRef = useRef(null);
@@ -314,9 +338,12 @@ function KakaoPlacePickerMap({
     overlaysRef.current.forEach((overlay) => overlay.setMap(null));
     overlaysRef.current = [];
 
-    const points = [startPlace, endPlace]
+    const selectedPoints = [startPlace, endPlace]
       .filter((place) => place?.lat && place?.lng)
       .map((place) => new kakao.maps.LatLng(Number(place.lat), Number(place.lng)));
+    const resultPlaces = (searchResults ?? []).filter((place) => place?.lat && place?.lng).slice(0, 8);
+    const resultPoints = resultPlaces.map((place) => new kakao.maps.LatLng(Number(place.lat), Number(place.lng)));
+    const allVisiblePoints = [...selectedPoints, ...resultPoints];
 
     if (startPlace?.lat && startPlace?.lng) {
       overlaysRef.current.push(
@@ -338,9 +365,21 @@ function KakaoPlacePickerMap({
       );
     }
 
-    if (points.length >= 2) {
+    resultPlaces.forEach((place) => {
+      const marker = new kakao.maps.Marker({
+        map,
+        position: new kakao.maps.LatLng(Number(place.lat), Number(place.lng)),
+        title: place.name,
+      });
+      kakao.maps.event.addListener(marker, 'click', () => {
+        onPickPlace(searchResultTarget || activePinTargetRef.current, place, { keepSearchResults: true });
+      });
+      overlaysRef.current.push(marker);
+    });
+
+    if (selectedPoints.length >= 2) {
       const line = new kakao.maps.Polyline({
-        path: points,
+        path: selectedPoints,
         strokeWeight: 5,
         strokeColor: routeMode === 'car' ? '#4b5563' : '#0e2a22',
         strokeOpacity: 0.82,
@@ -348,14 +387,17 @@ function KakaoPlacePickerMap({
       });
       line.setMap(map);
       overlaysRef.current.push(line);
+    }
+
+    if (allVisiblePoints.length > 1) {
       const bounds = new kakao.maps.LatLngBounds();
-      points.forEach((point) => bounds.extend(point));
+      allVisiblePoints.forEach((point) => bounds.extend(point));
       map.setBounds(bounds, 42, 42, 42, 42);
-    } else if (points.length === 1) {
-      map.setCenter(points[0]);
+    } else if (allVisiblePoints.length === 1) {
+      map.setCenter(allVisiblePoints[0]);
       map.setLevel(4);
     }
-  }, [startPlace, endPlace, routeMode, mapState]);
+  }, [startPlace, endPlace, searchResults, searchResultTarget, routeMode, mapState, onPickPlace]);
 
   return (
     <div className="mp-map-card">
@@ -363,6 +405,9 @@ function KakaoPlacePickerMap({
         <div>
           <span>지도에서 핀 찍기</span>
           <strong>{activePinTarget === 'start' ? '출발지를 선택 중' : '도착지를 선택 중'}</strong>
+          {searchResults.length > 0 && (
+            <em>{searchResultTarget === 'start' ? '출발지' : '도착지'} 검색 결과를 지도에서 선택하세요</em>
+          )}
         </div>
         <div className="mp-map-targets">
           <button
@@ -381,6 +426,38 @@ function KakaoPlacePickerMap({
           </button>
         </div>
       </div>
+      <div className="map-search-row">
+        <input
+          placeholder={activePinTarget === 'start' ? '출발지를 검색하세요' : '도착지를 검색하세요'}
+          value={searchQuery}
+          onChange={(e) => onSearchQueryChange(activePinTarget, e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') onSearch(activePinTarget);
+          }}
+        />
+        <button type="button" onClick={() => onSearch(activePinTarget)} aria-label="지도 장소 검색">
+          <Search size={17} />
+        </button>
+      </div>
+      {searchResults.length > 0 && (
+        <div className="map-result-list">
+          {searchResults.slice(0, 5).map((place) => (
+            <button
+              type="button"
+              key={place.id}
+              className={
+                (activePinTarget === 'start' ? startPlace?.id : endPlace?.id) === place.id
+                  ? 'active'
+                  : ''
+              }
+              onClick={() => onPickPlace(searchResultTarget || activePinTarget, place, { keepSearchResults: true })}
+            >
+              <strong>{place.name}</strong>
+              <span>{place.road_address || place.address || place.category}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="mp-map-canvas-wrap">
         <div className="mp-kakao-map" ref={mapNodeRef} />
         {mapState === 'missing-key' && (
@@ -517,6 +594,7 @@ function App() {
   const [endPlace, setEndPlace] = useState(null);
   const [startResults, setStartResults] = useState([]);
   const [endResults, setEndResults] = useState([]);
+  const [searchResultTarget, setSearchResultTarget] = useState(null);
   const [routeState, setRouteState] = useState('장소 입력');
   const [routeMode, setRouteMode] = useState('transit');
   const [includeAlternatives, setIncludeAlternatives] = useState(true);
@@ -665,7 +743,7 @@ function App() {
   const updateMinutes = (id, minutes) =>
     updateActiveProfile({
       plan: plan.map((b) =>
-        b.id === id ? { ...b, minutes: Math.max(0, Math.min(999, Number(minutes) || 0)) } : b,
+        b.id === id ? { ...b, minutes: normalizeMinutes(minutes) } : b,
       ),
     });
 
@@ -717,6 +795,20 @@ function App() {
 
   const updateRouteField = (field, value) => setRouteForm((cur) => ({ ...cur, [field]: value }));
 
+  const updateMapSearchQuery = (kind, value) => {
+    updateRouteField(`${kind}Query`, value);
+    setSearchResultTarget(kind);
+    setActivePinTarget(kind);
+    if (kind === 'start') {
+      setStartPlace(null);
+      setStartResults([]);
+    } else {
+      setEndPlace(null);
+      setEndResults([]);
+    }
+    setRouteOptions([]);
+  };
+
   const currentSearchPoint = startPlace
     ? `&lng=${encodeURIComponent(startPlace.lng)}&lat=${encodeURIComponent(startPlace.lat)}`
     : '';
@@ -725,29 +817,52 @@ function App() {
     const query = (kind === 'start' ? routeForm.startQuery : routeForm.endQuery).trim();
     if (!query) { setRouteState('검색어 필요'); return; }
     setRouteState('장소 검색 중');
+    setActivePinTarget(kind);
+    setSearchResultTarget(kind);
     try {
       const result = await apiRequest(
         `/api/places/search?query=${encodeURIComponent(query)}${kind === 'end' ? currentSearchPoint : ''}`,
       );
       if (kind === 'start') setStartResults(result.places ?? []);
       else setEndResults(result.places ?? []);
-      setRouteState((result.places ?? []).length ? '장소 선택' : '검색 결과 없음');
+      setRouteState((result.places ?? []).length ? '지도에서 장소 선택' : '검색 결과 없음');
     } catch {
       setRouteState('장소 검색 실패');
     }
   };
 
-  const selectPlace = (kind, place) => {
+  const selectPlace = (kind, place, options = {}) => {
+    const keepSearchResults = Boolean(options.keepSearchResults);
     if (kind === 'start') {
-      setStartPlace(place); setStartResults([]);
+      setStartPlace(place);
+      if (!keepSearchResults) setStartResults([]);
       setRouteForm((cur) => ({ ...cur, startQuery: place.name }));
-      setActivePinTarget('end');
+      if (!keepSearchResults) setActivePinTarget('end');
     } else {
-      setEndPlace(place); setEndResults([]);
+      setEndPlace(place);
+      if (!keepSearchResults) setEndResults([]);
       setRouteForm((cur) => ({ ...cur, endQuery: place.name }));
     }
+    if (!keepSearchResults) setSearchResultTarget(null);
     setRouteOptions([]);
-    setRouteState('경로 조회 가능');
+    setRouteState(`${kind === 'start' ? '출발지' : '도착지'} 선택됨`);
+  };
+
+  const clearPlace = (kind) => {
+    if (kind === 'start') {
+      setStartPlace(null);
+      setStartResults([]);
+      setRouteForm((cur) => ({ ...cur, startQuery: '' }));
+      setActivePinTarget('start');
+    } else {
+      setEndPlace(null);
+      setEndResults([]);
+      setRouteForm((cur) => ({ ...cur, endQuery: '' }));
+      setActivePinTarget('end');
+    }
+    setSearchResultTarget(null);
+    setRouteOptions([]);
+    setRouteState('장소 입력');
   };
 
   const useCurrentLocation = () => {
@@ -761,6 +876,7 @@ function App() {
           lng: pos.coords.longitude, lat: pos.coords.latitude,
         };
         setStartPlace(place); setStartResults([]);
+        setSearchResultTarget(null);
         setRouteForm((cur) => ({ ...cur, startQuery: '현재 위치' }));
         setRouteState('도착지 선택');
       },
@@ -794,6 +910,117 @@ function App() {
     }
   };
 
+  const createStoryImageBlob = async () => {
+    if (document.fonts?.ready) await document.fonts.ready;
+    const canvas = document.createElement('canvas');
+    canvas.width = 1080;
+    canvas.height = 1920;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0e2a22';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#f5c53a';
+    ctx.fillRect(70, 86, 940, 14);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '800 34px Pretendard, sans-serif';
+    ctx.fillText('TIMEBOMB ROUTINE', 70, 168);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '900 58px Pretendard, sans-serif';
+    ctx.fillText(activeProfile?.name || '나의 루틴', 70, 246);
+    ctx.fillStyle = 'rgba(255,255,255,0.48)';
+    ctx.font = '800 34px Pretendard, sans-serif';
+    ctx.fillText(`${alarm.dayLabel} 알람`, 70, 370);
+    ctx.fillStyle = '#f5c53a';
+    ctx.font = '900 190px Pretendard, sans-serif';
+    ctx.fillText(alarm.time, 70, 548);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '900 58px Pretendard, sans-serif';
+    ctx.fillText(`총 소요 ${formatDuration(totalMinutes)}`, 70, 690);
+    ctx.fillStyle = 'rgba(255,255,255,0.54)';
+    ctx.font = '800 34px Pretendard, sans-serif';
+    ctx.fillText(`도착 ${targetTime} · 여유 ${bufferMinutes}분`, 70, 748);
+
+    const rows = plan.slice(0, 9);
+    let y = 880;
+    rows.forEach((block, index) => {
+      const cat = getCategory(block.categoryId);
+      ctx.fillStyle = 'rgba(255,255,255,0.09)';
+      ctx.beginPath();
+      ctx.roundRect(70, y - 58, 940, 102, 30);
+      ctx.fill();
+      ctx.fillStyle = cat.color;
+      ctx.beginPath();
+      ctx.arc(122, y - 8, 24, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 28px Pretendard, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(String(index + 1), 122, y + 2);
+      ctx.textAlign = 'left';
+      ctx.font = '900 38px Pretendard, sans-serif';
+      const label = block.label.length > 19 ? `${block.label.slice(0, 18)}...` : block.label;
+      ctx.fillText(label, 170, y - 10);
+      ctx.fillStyle = 'rgba(255,255,255,0.48)';
+      ctx.font = '800 24px Pretendard, sans-serif';
+      ctx.fillText(block.isMergedRoute ? '이동 블록 합침' : cat.name, 170, y + 26);
+      ctx.fillStyle = '#f5c53a';
+      ctx.font = '900 34px Pretendard, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${Number(block.minutes) || 0}분`, 960, y + 2);
+      ctx.textAlign = 'left';
+      y += 122;
+    });
+    if (plan.length > rows.length) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '800 30px Pretendard, sans-serif';
+      ctx.fillText(`외 ${plan.length - rows.length}개 단계`, 76, y + 16);
+    }
+    ctx.fillStyle = '#f5c53a';
+    ctx.font = '900 38px Pretendard, sans-serif';
+    ctx.fillText('timebomb', 70, 1800);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '800 28px Pretendard, sans-serif';
+    ctx.fillText(window.location.origin, 70, 1844);
+    return canvasToBlob(canvas);
+  };
+
+  const shareStoryImage = async () => {
+    try {
+      const blob = await createStoryImageBlob();
+      const file = new File([blob], `timebomb-${activeProfile?.name || 'routine'}.png`, { type: 'image/png' });
+      if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+        await navigator.share({ files: [file], title: 'Timebomb 알람 결과' });
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = file.name;
+      link.click();
+      URL.revokeObjectURL(url);
+      setSaveState('스토리 이미지 저장됨');
+    } catch {
+      setSaveState('스토리 이미지 실패');
+    }
+  };
+
+  const shareSite = async () => {
+    const data = {
+      title: 'Timebomb',
+      text: '내 출발 알람 루틴 같이 만들어봐',
+      url: window.location.href,
+    };
+    try {
+      if (navigator.share) {
+        await navigator.share(data);
+        return;
+      }
+      await navigator.clipboard.writeText(data.url);
+      setSaveState('링크 복사됨');
+    } catch {
+      setSaveState('공유 실패');
+    }
+  };
+
   const mobileCategory = categories.find((c) => c.id === mobileCategoryId);
 
   /* ── Shared: Route panel ── */
@@ -823,34 +1050,23 @@ function App() {
         <span>대안 경로 함께 보기</span>
       </label>
       {[
-        { kind: 'start', query: routeForm.startQuery, place: startPlace, results: startResults, placeholder: '예: 홍대입구역' },
-        { kind: 'end', query: routeForm.endQuery, place: endPlace, results: endResults, placeholder: '예: 강남역' },
-      ].map(({ kind, query, place, results, placeholder }) => (
-        <div className="place-search" key={kind}>
-          <label className="time-field">
-            <span>{kind === 'start' ? '출발지' : '도착지'}</span>
-            <div className="search-row">
-              <input
-                placeholder={placeholder}
-                value={query}
-                onChange={(e) => {
-                  updateRouteField(`${kind}Query`, e.target.value);
-                  if (kind === 'start') setStartPlace(null); else setEndPlace(null);
-                }}
-              />
-              <button type="button" onClick={() => searchPlaces(kind)}><Search size={17} /></button>
+        { kind: 'start', place: startPlace },
+        { kind: 'end', place: endPlace },
+      ].map(({ kind, place }) => (
+        <div className="place-search place-search-readonly" key={kind}>
+          <span className="route-place-label">{kind === 'start' ? '출발지' : '도착지'}</span>
+          {place && (
+            <div className="selected-place">
+              <span>{kind === 'start' ? '출발' : '도착'}: {place.name}</span>
+              <button type="button" onClick={() => clearPlace(kind)} aria-label={`${kind === 'start' ? '출발지' : '도착지'} 선택 삭제`}>
+                <X size={13} />
+              </button>
             </div>
-          </label>
-          {place && <p className="selected-place">{kind === 'start' ? '출발' : '도착'}: {place.name}</p>}
-          {results.length > 0 && (
-            <div className="place-results">
-              {results.map((p) => (
-                <button type="button" key={p.id} onClick={() => selectPlace(kind, p)}>
-                  <strong>{p.name}</strong>
-                  <span>{p.road_address || p.address || p.category}</span>
-                </button>
-              ))}
-            </div>
+          )}
+          {!place && (
+            <button className="route-empty-place" type="button" onClick={() => setActivePinTarget(kind)}>
+              지도 상단에서 {kind === 'start' ? '출발지' : '도착지'}를 선택하세요
+            </button>
           )}
         </div>
       ))}
@@ -1023,7 +1239,7 @@ function App() {
                     <span>{cat.name}</span>
                   </div>
                   <label className="minute-field">
-                    <input type="number" min="0" max="999" value={block.minutes} onChange={(e) => updateMinutes(block.id, e.target.value)} />
+                    <input type="number" min="0" max="999" value={normalizeMinutes(block.minutes)} onChange={(e) => updateMinutes(block.id, e.target.value)} />
                     <span>분</span>
                   </label>
                   <button className="delete-button" aria-label={`${block.label} 삭제`} onClick={() => removeBlock(block.id)}>
@@ -1037,7 +1253,6 @@ function App() {
         </section>
 
         <aside className="summary" aria-label="총 시간">
-          {RoutePanelUI()}
           <div className="alarm-panel">
             <div className="alarm-title"><AlarmClock size={18} /><span>알람 계산</span></div>
             <label className="time-field">
@@ -1057,6 +1272,20 @@ function App() {
               <strong>{alarm.time}</strong>
             </div>
           </div>
+          <KakaoPlacePickerMap
+            startPlace={startPlace}
+            endPlace={endPlace}
+            searchResults={searchResultTarget === 'start' ? startResults : searchResultTarget === 'end' ? endResults : []}
+            searchResultTarget={searchResultTarget}
+            searchQuery={activePinTarget === 'start' ? routeForm.startQuery : routeForm.endQuery}
+            routeMode={routeMode}
+            activePinTarget={activePinTarget}
+            onActivePinTargetChange={setActivePinTarget}
+            onSearchQueryChange={updateMapSearchQuery}
+            onSearch={searchPlaces}
+            onPickPlace={selectPlace}
+          />
+          {RoutePanelUI()}
           <div className="total-panel">
             <p>총 소요 시간</p>
             <strong>{formatDuration(totalMinutes)}</strong>
@@ -1147,9 +1376,14 @@ function App() {
           <KakaoPlacePickerMap
             startPlace={startPlace}
             endPlace={endPlace}
+            searchResults={searchResultTarget === 'start' ? startResults : searchResultTarget === 'end' ? endResults : []}
+            searchResultTarget={searchResultTarget}
+            searchQuery={activePinTarget === 'start' ? routeForm.startQuery : routeForm.endQuery}
             routeMode={routeMode}
             activePinTarget={activePinTarget}
             onActivePinTargetChange={setActivePinTarget}
+            onSearchQueryChange={updateMapSearchQuery}
+            onSearch={searchPlaces}
             onPickPlace={selectPlace}
           />
           {RoutePanelUI()}
@@ -1228,7 +1462,7 @@ function App() {
                   <div className="mp-block-right">
                     <label className="mp-minute">
                       <input
-                        type="number" min="0" max="999" value={block.minutes}
+                        type="number" min="0" max="999" value={normalizeMinutes(block.minutes)}
                         onChange={(e) => updateMinutes(block.id, e.target.value)}
                       />
                       <span>분</span>
@@ -1283,6 +1517,17 @@ function App() {
             <span>여유시간</span>
             <strong>{bufferMinutes}분</strong>
           </div>
+        </div>
+
+        <div className="mp-share-section">
+          <button className="mp-share-primary" type="button" onClick={shareStoryImage}>
+            <Download size={17} />
+            <span>스토리용 이미지</span>
+          </button>
+          <button className="mp-share-secondary" type="button" onClick={shareSite}>
+            <Share2 size={17} />
+            <span>친구에게 공유</span>
+          </button>
         </div>
 
         <div className="mp-sequence-section">
