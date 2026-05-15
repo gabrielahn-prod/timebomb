@@ -1,4 +1,7 @@
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import httpx
@@ -7,12 +10,13 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
 from .models import Device, Schedule
 from .schemas import ScheduleCreate, ScheduleOut, ScheduleUpdate
 
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 Base.metadata.create_all(bind=engine)
 
@@ -35,6 +39,7 @@ STARTER_PLAN = [
 ]
 
 ODSAY_ROUTE_URL = "https://api.odsay.com/v1/api/searchPubTransPathT"
+KAKAO_DRIVING_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 KAKAO_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 
 
@@ -44,13 +49,17 @@ class TransitEstimateRequest(BaseModel):
     end_lng: float = Field(..., description="도착지 경도")
     end_lat: float = Field(..., description="도착지 위도")
     search_path_type: int = Field(default=0, ge=0, le=2)
+    route_mode: Literal["transit", "car"] = "transit"
+    include_alternatives: bool = True
 
 
 class TransitRouteOut(BaseModel):
     title: str
     total_minutes: int
     payment: int | None = None
+    distance_meters: int | None = None
     total_walk_meters: int | None = None
+    mode: str = "transit"
     blocks: list[dict]
 
 
@@ -70,6 +79,38 @@ class PlaceOut(BaseModel):
 
 class PlaceSearchOut(BaseModel):
     places: list[PlaceOut]
+
+
+class AdminScheduleOut(BaseModel):
+    id: str
+    name: str
+    target_time: str
+    buffer_minutes: int
+    total_minutes: int
+    block_count: int
+    category_minutes: dict[str, int]
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AdminDeviceOut(BaseModel):
+    id: int
+    device_id: str
+    schedule_count: int
+    total_minutes: int
+    block_count: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    schedules: list[AdminScheduleOut]
+
+
+class AdminDashboardOut(BaseModel):
+    total_devices: int
+    total_schedules: int
+    total_blocks: int
+    total_minutes: int
+    updated_at: datetime
+    devices: list[AdminDeviceOut]
 
 
 @app.get("/health")
@@ -193,19 +234,73 @@ def path_to_route(path: dict, route_index: int) -> TransitRouteOut:
         )
     ]
     total_minutes = minutes(info.get("totalTime")) or sum(block["minutes"] for block in blocks)
-    title = info.get("mapObj") or f"추천 경로 {route_index + 1}"
+    title = f"추천 경로 {route_index + 1}"
 
     return TransitRouteOut(
         title=title,
         total_minutes=total_minutes,
         payment=info.get("payment"),
+        distance_meters=info.get("totalDistance") or info.get("trafficDistance"),
         total_walk_meters=info.get("totalWalk"),
+        mode="transit",
         blocks=blocks,
     )
 
 
-@app.post("/api/transit/estimate", response_model=TransitEstimateOut)
-async def estimate_transit(payload: TransitEstimateRequest):
+def seconds_to_minutes(value) -> int:
+    try:
+        return max(0, round(float(value) / 60))
+    except (TypeError, ValueError):
+        return 0
+
+
+def format_distance(distance_meters: int | None) -> str:
+    if not distance_meters:
+        return ""
+    if distance_meters >= 1000:
+        return f"{distance_meters / 1000:.1f}km"
+    return f"{distance_meters}m"
+
+
+def kakao_key() -> str:
+    api_key = os.getenv("KAKAO_MOBILITY_REST_API_KEY") or os.getenv("KAKAO_REST_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY is not configured")
+    return api_key
+
+
+def kakao_route_to_route(route: dict, route_index: int, mode: str) -> TransitRouteOut:
+    summary = route.get("summary") or {}
+    total_minutes = seconds_to_minutes(summary.get("duration"))
+    distance_meters = minutes(summary.get("distance"))
+    mode_label = "차량으로 이동"
+    title_label = "차량 경로"
+    distance_label = format_distance(distance_meters)
+
+    return TransitRouteOut(
+        title=" · ".join(
+            piece for piece in [f"{title_label} {route_index + 1}", distance_label] if piece
+        ),
+        total_minutes=total_minutes,
+        payment=(summary.get("fare") or {}).get("taxi"),
+        distance_meters=distance_meters,
+        total_walk_meters=None,
+        mode=mode,
+        blocks=[
+            {
+                "id": f"kakao-{mode}-{uuid4().hex[:8]}",
+                "categoryId": "car",
+                "label": mode_label,
+                "minutes": total_minutes,
+                "source": "kakao",
+                "sourceType": mode,
+                "distanceMeters": distance_meters,
+            }
+        ],
+    )
+
+
+async def estimate_transit_route(payload: TransitEstimateRequest) -> TransitEstimateOut:
     api_key = os.getenv("ODSAY_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ODSAY_API_KEY is not configured")
@@ -240,6 +335,51 @@ async def estimate_transit(payload: TransitEstimateRequest):
         key=lambda route: route.total_minutes,
     )[:3]
     return TransitEstimateOut(routes=routes)
+
+
+async def estimate_kakao_route(payload: TransitEstimateRequest) -> TransitEstimateOut:
+    mode = payload.route_mode
+    if mode != "car":
+        return TransitEstimateOut(routes=[])
+
+    params = {
+        "origin": f"{payload.start_lng},{payload.start_lat}",
+        "destination": f"{payload.end_lng},{payload.end_lat}",
+        "summary": "true",
+        "priority": "RECOMMEND",
+        "alternatives": str(payload.include_alternatives).lower(),
+    }
+    headers = {
+        "Authorization": f"KakaoAK {kakao_key()}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(KAKAO_DRIVING_ROUTE_URL, params=params, headers=headers)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Kakao route request failed: {exc.response.text}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Kakao route request failed: {exc}") from exc
+
+    data = response.json()
+    routes = [
+        kakao_route_to_route(route, index, mode)
+        for index, route in enumerate(data.get("routes") or [])
+        if route.get("result_code", 0) == 0
+    ]
+    return TransitEstimateOut(routes=routes[:3])
+
+
+@app.post("/api/transit/estimate", response_model=TransitEstimateOut)
+async def estimate_transit(payload: TransitEstimateRequest):
+    if payload.route_mode == "transit":
+        return await estimate_transit_route(payload)
+    return await estimate_kakao_route(payload)
 
 
 @app.get("/api/places/search", response_model=PlaceSearchOut)
@@ -319,6 +459,67 @@ def get_schedule_or_404(db: Session, device_id: str, schedule_id: str) -> Schedu
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
     return schedule
+
+
+def plan_category_minutes(plan: list[dict] | None) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for block in plan or []:
+        category_id = str(block.get("categoryId") or "unknown")
+        totals[category_id] = totals.get(category_id, 0) + minutes(block.get("minutes"))
+    return totals
+
+
+def schedule_to_admin_out(schedule: Schedule) -> AdminScheduleOut:
+    plan = schedule.plan or []
+    return AdminScheduleOut(
+        id=schedule.id,
+        name=schedule.name,
+        target_time=schedule.target_time,
+        buffer_minutes=schedule.buffer_minutes,
+        total_minutes=sum(minutes(block.get("minutes")) for block in plan),
+        block_count=len(plan),
+        category_minutes=plan_category_minutes(plan),
+        created_at=schedule.created_at,
+        updated_at=schedule.updated_at,
+    )
+
+
+@app.get("/api/admin/dashboard", response_model=AdminDashboardOut)
+def admin_dashboard(db: Session = Depends(get_db)):
+    devices = db.scalars(
+        select(Device)
+        .options(selectinload(Device.schedules))
+        .order_by(Device.updated_at.desc(), Device.created_at.desc())
+    ).all()
+
+    admin_devices = []
+    for device in devices:
+        schedules = sorted(
+            [schedule_to_admin_out(schedule) for schedule in device.schedules],
+            key=lambda schedule: (schedule.updated_at or schedule.created_at or datetime.min),
+            reverse=True,
+        )
+        admin_devices.append(
+            AdminDeviceOut(
+                id=device.id,
+                device_id=device.device_id,
+                schedule_count=len(schedules),
+                total_minutes=sum(schedule.total_minutes for schedule in schedules),
+                block_count=sum(schedule.block_count for schedule in schedules),
+                created_at=device.created_at,
+                updated_at=device.updated_at,
+                schedules=schedules,
+            )
+        )
+
+    return AdminDashboardOut(
+        total_devices=len(admin_devices),
+        total_schedules=sum(device.schedule_count for device in admin_devices),
+        total_blocks=sum(device.block_count for device in admin_devices),
+        total_minutes=sum(device.total_minutes for device in admin_devices),
+        updated_at=datetime.now(timezone.utc),
+        devices=admin_devices,
+    )
 
 
 @app.get("/api/devices/{device_id}/schedules", response_model=list[ScheduleOut])

@@ -2,6 +2,7 @@ node_modules/
 dist/
 .venv/
 backend/.venv/
+.env
 backend/.env
 backend/data/
 .deploy/
