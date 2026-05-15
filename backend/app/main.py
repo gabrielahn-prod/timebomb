@@ -122,7 +122,18 @@ def transit_kind(segment: dict) -> tuple[str, str, str]:
     return "inside", "", ""
 
 
-def segment_to_blocks(segment: dict, index: int) -> list[dict]:
+def walk_fallback_label(index: int, next_segment: dict | None) -> str:
+    next_traffic_type = next_segment.get("trafficType") if next_segment else None
+    if next_traffic_type == 2:
+        return "정류장까지 이동"
+    if next_traffic_type == 1:
+        return "역까지 이동"
+    if index == 0:
+        return "도보"
+    return "환승 이동"
+
+
+def segment_to_blocks(segment: dict, index: int, next_segment: dict | None = None) -> list[dict]:
     section_minutes = minutes(segment.get("sectionTime"))
     if section_minutes <= 0:
         return []
@@ -155,7 +166,7 @@ def segment_to_blocks(segment: dict, index: int) -> list[dict]:
         )
         return blocks
 
-    fallback = "역까지 이동" if index == 0 else "환승 이동"
+    fallback = walk_fallback_label(index, next_segment)
 
     return [
         {
@@ -175,7 +186,11 @@ def path_to_route(path: dict, route_index: int) -> TransitRouteOut:
     blocks = [
         block
         for index, segment in enumerate(subpaths)
-        for block in segment_to_blocks(segment, index)
+        for block in segment_to_blocks(
+            segment,
+            index,
+            subpaths[index + 1] if index + 1 < len(subpaths) else None,
+        )
     ]
     total_minutes = minutes(info.get("totalTime")) or sum(block["minutes"] for block in blocks)
     title = info.get("mapObj") or f"추천 경로 {route_index + 1}"

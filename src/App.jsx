@@ -44,11 +44,11 @@ const categories = [
   },
   {
     id: 'inside',
-    name: '단지 이동',
+    name: '이동',
     icon: Home,
     color: '#f4a261',
     soft: '#ffefd9',
-    blocks: ['엘리베이터', '계단', '현관까지 이동'],
+    blocks: ['엘리베이터', '계단', '현관까지 이동', '도보'],
   },
   {
     id: 'bus',
@@ -56,7 +56,7 @@ const categories = [
     icon: Bus,
     color: '#3f7cac',
     soft: '#dcecff',
-    blocks: ['버스 평균 대기시간', '버스 시간표 맞추기', '버스 탑승 시간'],
+    blocks: ['정류장까지 이동', '버스 평균 대기시간', '버스 시간표 맞추기', '버스 탑승 시간'],
   },
   {
     id: 'subway',
