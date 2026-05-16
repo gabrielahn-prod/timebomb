@@ -31,6 +31,7 @@ import './styles.css';
 
 const ACTIVE_PROFILE_KEY = 'timebomb:active-profile-id:v1';
 const DEVICE_ID_KEY = 'timebomb:device-id:v1';
+const ADMIN_PASSWORD_SESSION_KEY = 'timebomb:admin-password:v1';
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 const KAKAO_MAP_APP_KEY = import.meta.env.VITE_KAKAO_MAP_APP_KEY;
 
@@ -482,19 +483,89 @@ function AdminDashboard() {
   const [dashboard, setDashboard] = useState(null);
   const [adminState, setAdminState] = useState('불러오는 중');
   const [selectedDeviceId, setSelectedDeviceId] = useState('all');
+  const [adminPassword, setAdminPassword] = useState(() => sessionStorage.getItem(ADMIN_PASSWORD_SESSION_KEY) || '');
+  const [passwordInput, setPasswordInput] = useState('');
+  const [isAdminAuthed, setIsAdminAuthed] = useState(() => Boolean(sessionStorage.getItem(ADMIN_PASSWORD_SESSION_KEY)));
 
-  const loadDashboard = async () => {
+  const loadDashboard = async (password = adminPassword) => {
+    if (!password) {
+      setAdminState('비밀번호 필요');
+      return;
+    }
     setAdminState('불러오는 중');
     try {
-      const result = await apiRequest('/api/admin/dashboard');
+      const result = await apiRequest('/api/admin/dashboard', {
+        headers: { 'X-Admin-Password': password },
+      });
       setDashboard(result);
       setAdminState('최신 데이터');
     } catch {
+      sessionStorage.removeItem(ADMIN_PASSWORD_SESSION_KEY);
+      setIsAdminAuthed(false);
+      setAdminPassword('');
       setAdminState('불러오기 실패');
     }
   };
 
-  useEffect(() => { loadDashboard(); }, []);
+  const loginAdmin = async (event) => {
+    event.preventDefault();
+    const password = passwordInput.trim();
+    if (!password) {
+      setAdminState('비밀번호 필요');
+      return;
+    }
+    setAdminState('확인 중');
+    try {
+      await apiRequest('/api/admin/login', {
+        method: 'POST',
+        body: JSON.stringify({ password }),
+      });
+      sessionStorage.setItem(ADMIN_PASSWORD_SESSION_KEY, password);
+      setAdminPassword(password);
+      setIsAdminAuthed(true);
+      setPasswordInput('');
+      await loadDashboard(password);
+    } catch {
+      setAdminState('비밀번호가 맞지 않습니다');
+    }
+  };
+
+  const logoutAdmin = () => {
+    sessionStorage.removeItem(ADMIN_PASSWORD_SESSION_KEY);
+    setAdminPassword('');
+    setIsAdminAuthed(false);
+    setDashboard(null);
+    setAdminState('로그아웃됨');
+  };
+
+  useEffect(() => {
+    if (isAdminAuthed) loadDashboard(adminPassword);
+  }, []);
+
+  if (!isAdminAuthed) {
+    return (
+      <main className="admin-shell admin-login-shell">
+        <form className="admin-login-card" onSubmit={loginAdmin}>
+          <span className="admin-kicker">Timebomb Admin</span>
+          <h1>관리자 로그인</h1>
+          <p>디바이스와 스케줄 대시보드를 보려면 관리자 비밀번호가 필요합니다.</p>
+          <label>
+            <span>비밀번호</span>
+            <input
+              type="password"
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+              autoFocus
+              autoComplete="current-password"
+              placeholder="ADMIN_PASSWORD"
+            />
+          </label>
+          <button type="submit">들어가기</button>
+          <small>{adminState}</small>
+        </form>
+      </main>
+    );
+  }
 
   const devices = dashboard?.devices ?? [];
   const visibleDevices =
@@ -513,9 +584,12 @@ function AdminDashboard() {
           <h1>디바이스 스케줄 대시보드</h1>
           <p>어떤 디바이스가 어떤 스케줄을 만들고 수정했는지 한눈에 확인합니다.</p>
         </div>
-        <button className="admin-refresh" type="button" onClick={loadDashboard}>
-          <RotateCcw size={18} />새로고침
-        </button>
+        <div className="admin-header-actions">
+          <button className="admin-refresh" type="button" onClick={() => loadDashboard()}>
+            <RotateCcw size={18} />새로고침
+          </button>
+          <button className="admin-refresh" type="button" onClick={logoutAdmin}>로그아웃</button>
+        </div>
       </header>
       <section className="admin-metrics" aria-label="요약">
         <div><Smartphone size={20} /><span>디바이스</span><strong>{dashboard?.total_devices ?? 0}</strong></div>
@@ -603,6 +677,7 @@ function App() {
   const [mobileCategoryId, setMobileCategoryId] = useState(null);
   const [activePinTarget, setActivePinTarget] = useState('start');
   const [mobilePage, setMobilePage] = useState('setup'); // 'setup' | 'builder' | 'result'
+  const [shareImage, setShareImage] = useState(null);
 
   const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? profiles[0];
   const plan = activeProfile?.plan ?? [];
@@ -632,6 +707,10 @@ function App() {
   useEffect(() => {
     if (activeProfile?.id) localStorage.setItem(ACTIVE_PROFILE_KEY, activeProfile.id);
   }, [activeProfile?.id]);
+
+  useEffect(() => () => {
+    if (shareImage?.url) URL.revokeObjectURL(shareImage.url);
+  }, [shareImage?.url]);
 
   const persistProfile = async (profile = activeProfile) => {
     if (!profile) return;
@@ -912,10 +991,41 @@ function App() {
 
   const createStoryImageBlob = async () => {
     if (document.fonts?.ready) await document.fonts.ready;
+    const visibleCategories = categories
+      .map((cat) => ({
+        ...cat,
+        minutes: plan
+          .filter((block) => block.categoryId === cat.id)
+          .reduce((sum, block) => sum + normalizeMinutes(block.minutes), 0),
+      }))
+      .filter((cat) => cat.minutes > 0);
+    const rowHeight = 112;
+    const breakdownHeight = Math.max(0, visibleCategories.length) * 86;
+    const contentHeight = 1120 + Math.max(plan.length, 1) * rowHeight + breakdownHeight;
     const canvas = document.createElement('canvas');
     canvas.width = 1080;
-    canvas.height = 1920;
+    canvas.height = Math.max(1920, contentHeight);
     const ctx = canvas.getContext('2d');
+    const drawText = (text, x, y, maxWidth, lineHeight, maxLines = 2) => {
+      const words = String(text).split(' ');
+      const lines = [];
+      let line = '';
+      words.forEach((word) => {
+        const test = line ? `${line} ${word}` : word;
+        if (ctx.measureText(test).width > maxWidth && line) {
+          lines.push(line);
+          line = word;
+        } else {
+          line = test;
+        }
+      });
+      if (line) lines.push(line);
+      lines.slice(0, maxLines).forEach((value, index) => {
+        const suffix = lines.length > maxLines && index === maxLines - 1 ? '...' : '';
+        ctx.fillText(`${value}${suffix}`, x, y + index * lineHeight);
+      });
+    };
+
     ctx.fillStyle = '#0e2a22';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = '#f5c53a';
@@ -932,16 +1042,44 @@ function App() {
     ctx.fillStyle = '#f5c53a';
     ctx.font = '900 190px Pretendard, sans-serif';
     ctx.fillText(alarm.time, 70, 548);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '900 58px Pretendard, sans-serif';
-    ctx.fillText(`총 소요 ${formatDuration(totalMinutes)}`, 70, 690);
-    ctx.fillStyle = 'rgba(255,255,255,0.54)';
-    ctx.font = '800 34px Pretendard, sans-serif';
-    ctx.fillText(`도착 ${targetTime} · 여유 ${bufferMinutes}분`, 70, 748);
 
-    const rows = plan.slice(0, 9);
-    let y = 880;
-    rows.forEach((block, index) => {
+    const statCards = [
+      ['총 소요시간', formatDuration(totalMinutes)],
+      ['도착 목표', targetTime],
+      ['여유시간', `${bufferMinutes}분`],
+    ];
+    statCards.forEach(([label, value], index) => {
+      const x = 70 + index * 318;
+      ctx.fillStyle = 'rgba(255,255,255,0.09)';
+      ctx.beginPath();
+      ctx.roundRect(x, 640, 292, 132, 30);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.font = '800 26px Pretendard, sans-serif';
+      ctx.fillText(label, x + 30, 690);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 42px Pretendard, sans-serif';
+      ctx.fillText(value, x + 30, 742);
+    });
+
+    let y = 890;
+    ctx.fillStyle = 'rgba(255,255,255,0.52)';
+    ctx.font = '900 30px Pretendard, sans-serif';
+    ctx.fillText('해야 할 순서', 70, y);
+    y += 86;
+
+    if (plan.length === 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.09)';
+      ctx.beginPath();
+      ctx.roundRect(70, y - 58, 940, 102, 30);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.48)';
+      ctx.font = '800 30px Pretendard, sans-serif';
+      ctx.fillText('아직 정해진 순서가 없습니다.', 110, y);
+      y += rowHeight;
+    }
+
+    plan.forEach((block, index) => {
       const cat = getCategory(block.categoryId);
       ctx.fillStyle = 'rgba(255,255,255,0.09)';
       ctx.beginPath();
@@ -957,29 +1095,53 @@ function App() {
       ctx.fillText(String(index + 1), 122, y + 2);
       ctx.textAlign = 'left';
       ctx.font = '900 38px Pretendard, sans-serif';
-      const label = block.label.length > 19 ? `${block.label.slice(0, 18)}...` : block.label;
-      ctx.fillText(label, 170, y - 10);
+      drawText(block.label, 170, y - 18, 640, 42, 2);
       ctx.fillStyle = 'rgba(255,255,255,0.48)';
       ctx.font = '800 24px Pretendard, sans-serif';
       ctx.fillText(block.isMergedRoute ? '이동 블록 합침' : cat.name, 170, y + 26);
       ctx.fillStyle = '#f5c53a';
       ctx.font = '900 34px Pretendard, sans-serif';
       ctx.textAlign = 'right';
-      ctx.fillText(`${Number(block.minutes) || 0}분`, 960, y + 2);
+      ctx.fillText(`${normalizeMinutes(block.minutes)}분`, 960, y + 2);
       ctx.textAlign = 'left';
-      y += 122;
+      y += rowHeight;
     });
-    if (plan.length > rows.length) {
-      ctx.fillStyle = 'rgba(255,255,255,0.5)';
-      ctx.font = '800 30px Pretendard, sans-serif';
-      ctx.fillText(`외 ${plan.length - rows.length}개 단계`, 76, y + 16);
-    }
+
+    y += 48;
+    ctx.fillStyle = 'rgba(255,255,255,0.52)';
+    ctx.font = '900 30px Pretendard, sans-serif';
+    ctx.fillText('카테고리별 시간', 70, y);
+    y += 58;
+
+    visibleCategories.forEach((cat) => {
+      const pct = totalMinutes > 0 ? cat.minutes / totalMinutes : 0;
+      ctx.fillStyle = cat.color;
+      ctx.beginPath();
+      ctx.roundRect(70, y - 26, 52, 52, 15);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 30px Pretendard, sans-serif';
+      ctx.fillText(cat.name, 146, y - 4);
+      ctx.textAlign = 'right';
+      ctx.fillText(`${cat.minutes}분`, 1008, y - 4);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.beginPath();
+      ctx.roundRect(146, y + 20, 862, 14, 999);
+      ctx.fill();
+      ctx.fillStyle = cat.color;
+      ctx.beginPath();
+      ctx.roundRect(146, y + 20, Math.max(18, 862 * pct), 14, 999);
+      ctx.fill();
+      y += 86;
+    });
+
     ctx.fillStyle = '#f5c53a';
     ctx.font = '900 38px Pretendard, sans-serif';
-    ctx.fillText('timebomb', 70, 1800);
+    ctx.fillText('timebomb', 70, canvas.height - 120);
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.font = '800 28px Pretendard, sans-serif';
-    ctx.fillText(window.location.origin, 70, 1844);
+    ctx.fillText(window.location.origin, 70, canvas.height - 76);
     return canvasToBlob(canvas);
   };
 
@@ -991,16 +1153,29 @@ function App() {
         await navigator.share({ files: [file], title: 'Timebomb 알람 결과' });
         return;
       }
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = file.name;
-      link.click();
-      URL.revokeObjectURL(url);
-      setSaveState('스토리 이미지 저장됨');
+      setShareImage((current) => {
+        if (current?.url) URL.revokeObjectURL(current.url);
+        return { url: URL.createObjectURL(blob), name: file.name };
+      });
+      setSaveState('이미지 준비됨');
     } catch {
       setSaveState('스토리 이미지 실패');
     }
+  };
+
+  const downloadShareImage = () => {
+    if (!shareImage?.url) return;
+    const link = document.createElement('a');
+    link.href = shareImage.url;
+    link.download = shareImage.name;
+    link.click();
+  };
+
+  const closeShareImage = () => {
+    setShareImage((current) => {
+      if (current?.url) URL.revokeObjectURL(current.url);
+      return null;
+    });
   };
 
   const shareSite = async () => {
@@ -1522,7 +1697,7 @@ function App() {
         <div className="mp-share-section">
           <button className="mp-share-primary" type="button" onClick={shareStoryImage}>
             <Download size={17} />
-            <span>스토리용 이미지</span>
+            <span>결과 이미지 저장</span>
           </button>
           <button className="mp-share-secondary" type="button" onClick={shareSite}>
             <Share2 size={17} />
@@ -1593,6 +1768,28 @@ function App() {
       )}
 
       {isMobilePaletteOpen && <PaletteSheet />}
+      {shareImage && (
+        <div className="share-image-modal" role="dialog" aria-modal="true">
+          <button className="share-image-backdrop" type="button" aria-label="닫기" onClick={closeShareImage} />
+          <section className="share-image-sheet">
+            <div className="share-image-head">
+              <strong>결과 이미지</strong>
+              <button type="button" onClick={closeShareImage} aria-label="닫기"><X size={18} /></button>
+            </div>
+            <img src={shareImage.url} alt="Timebomb 결과 이미지" />
+            <div className="share-image-actions">
+              <button type="button" onClick={downloadShareImage}>
+                <Download size={16} />
+                다운로드
+              </button>
+              <a href={shareImage.url} target="_blank" rel="noreferrer">
+                새 창 열기
+              </a>
+            </div>
+            <p>카카오톡 안에서는 이미지를 길게 눌러 저장하거나 새 창에서 열어 저장하세요.</p>
+          </section>
+        </div>
+      )}
     </main>
   );
 }

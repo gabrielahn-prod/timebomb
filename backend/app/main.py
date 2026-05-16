@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -6,7 +7,7 @@ from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -113,9 +114,35 @@ class AdminDashboardOut(BaseModel):
     devices: list[AdminDeviceOut]
 
 
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+class AdminLoginOut(BaseModel):
+    ok: bool
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def verify_admin_password(x_admin_password: str | None = Header(default=None)) -> None:
+    expected = os.getenv("ADMIN_PASSWORD")
+    if not expected:
+        raise HTTPException(status_code=500, detail="ADMIN_PASSWORD is not configured")
+    if not x_admin_password or not secrets.compare_digest(x_admin_password, expected):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+
+
+@app.post("/api/admin/login", response_model=AdminLoginOut)
+def admin_login(payload: AdminLoginRequest):
+    expected = os.getenv("ADMIN_PASSWORD")
+    if not expected:
+        raise HTTPException(status_code=500, detail="ADMIN_PASSWORD is not configured")
+    if not secrets.compare_digest(payload.password, expected):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    return AdminLoginOut(ok=True)
 
 
 def minutes(value) -> int:
@@ -485,7 +512,10 @@ def schedule_to_admin_out(schedule: Schedule) -> AdminScheduleOut:
 
 
 @app.get("/api/admin/dashboard", response_model=AdminDashboardOut)
-def admin_dashboard(db: Session = Depends(get_db)):
+def admin_dashboard(
+    _: None = Depends(verify_admin_password),
+    db: Session = Depends(get_db),
+):
     devices = db.scalars(
         select(Device)
         .options(selectinload(Device.schedules))
