@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createClient } from '@supabase/supabase-js';
 import {
   AlarmClock,
   Bath,
@@ -32,8 +33,12 @@ import './styles.css';
 const ACTIVE_PROFILE_KEY = 'timebomb:active-profile-id:v1';
 const DEVICE_ID_KEY = 'timebomb:device-id:v1';
 const ADMIN_PASSWORD_SESSION_KEY = 'timebomb:admin-password:v1';
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 const KAKAO_MAP_APP_KEY = import.meta.env.VITE_KAKAO_MAP_APP_KEY;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabase = SUPABASE_URL && SUPABASE_ANON_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
 
 const routeModes = [
   { id: 'transit', label: '대중교통', icon: Train },
@@ -212,17 +217,43 @@ function serializeProfile(profile) {
   };
 }
 
-async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  });
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `API request failed: ${response.status}`);
+function requireSupabase() {
+  if (!supabase) {
+    throw new Error('Supabase environment variables are not configured');
   }
-  if (response.status === 204) return null;
-  return response.json();
+  return supabase;
+}
+
+async function invokeFunction(name, options = {}) {
+  const client = requireSupabase();
+  const { data, error } = await client.functions.invoke(name, options);
+  if (error) throw error;
+  return data;
+}
+
+async function listSchedules(deviceId) {
+  const result = await invokeFunction('schedules', {
+    body: { action: 'list', device_id: deviceId, starter_profile: serializeProfile(defaultProfile) },
+  });
+  return result.schedules ?? [];
+}
+
+async function saveSchedule(deviceId, profile, payload) {
+  const result = await invokeFunction('schedules', {
+    body: {
+      action: profile.isNew ? 'create' : 'update',
+      device_id: deviceId,
+      schedule_id: profile.id,
+      schedule: payload,
+    },
+  });
+  return result.schedule;
+}
+
+async function deleteSchedule(deviceId, scheduleId) {
+  await invokeFunction('schedules', {
+    body: { action: 'delete', device_id: deviceId, schedule_id: scheduleId },
+  });
 }
 
 let kakaoMapLoader;
@@ -494,8 +525,8 @@ function AdminDashboard() {
     }
     setAdminState('불러오는 중');
     try {
-      const result = await apiRequest('/api/admin/dashboard', {
-        headers: { 'X-Admin-Password': password },
+      const result = await invokeFunction('admin-dashboard', {
+        headers: { 'x-admin-password': password },
       });
       setDashboard(result);
       setAdminState('최신 데이터');
@@ -516,10 +547,7 @@ function AdminDashboard() {
     }
     setAdminState('확인 중');
     try {
-      await apiRequest('/api/admin/login', {
-        method: 'POST',
-        body: JSON.stringify({ password }),
-      });
+      await invokeFunction('admin-dashboard', { body: { password, loginOnly: true } });
       sessionStorage.setItem(ADMIN_PASSWORD_SESSION_KEY, password);
       setAdminPassword(password);
       setIsAdminAuthed(true);
@@ -689,7 +717,7 @@ function App() {
     async function load() {
       setSaveState('불러오는 중');
       try {
-        const schedules = await apiRequest(`/api/devices/${encodeURIComponent(deviceId)}/schedules`);
+        const schedules = await listSchedules(deviceId);
         if (ignore) return;
         const next = schedules.map(normalizeProfile);
         setProfiles(next.length > 0 ? next : [defaultProfile]);
@@ -719,14 +747,7 @@ function App() {
     setSaveState('저장 중');
     try {
       const payload = serializeProfile({ ...profile, name });
-      const saved = profile.isNew
-        ? await apiRequest(`/api/devices/${encodeURIComponent(deviceId)}/schedules`, {
-            method: 'POST', body: JSON.stringify({ id: profile.id, ...payload }),
-          })
-        : await apiRequest(
-            `/api/devices/${encodeURIComponent(deviceId)}/schedules/${encodeURIComponent(profile.id)}`,
-            { method: 'PUT', body: JSON.stringify(payload) },
-          );
+      const saved = await saveSchedule(deviceId, profile, payload);
       const sp = normalizeProfile(saved);
       setProfiles((cur) => cur.map((p) => (p.id === sp.id ? sp : p)));
       setSaveState('저장됨');
@@ -858,10 +879,7 @@ function App() {
     }
     setSaveState('삭제 중');
     try {
-      await apiRequest(
-        `/api/devices/${encodeURIComponent(deviceId)}/schedules/${encodeURIComponent(activeProfile.id)}`,
-        { method: 'DELETE' },
-      );
+      await deleteSchedule(deviceId, activeProfile.id);
       const next = profiles.filter((p) => p.id !== activeProfile.id);
       const fb = makeProfile();
       setProfiles(next.length > 0 ? next : [fb]);
@@ -888,10 +906,6 @@ function App() {
     setRouteOptions([]);
   };
 
-  const currentSearchPoint = startPlace
-    ? `&lng=${encodeURIComponent(startPlace.lng)}&lat=${encodeURIComponent(startPlace.lat)}`
-    : '';
-
   const searchPlaces = async (kind) => {
     const query = (kind === 'start' ? routeForm.startQuery : routeForm.endQuery).trim();
     if (!query) { setRouteState('검색어 필요'); return; }
@@ -899,9 +913,13 @@ function App() {
     setActivePinTarget(kind);
     setSearchResultTarget(kind);
     try {
-      const result = await apiRequest(
-        `/api/places/search?query=${encodeURIComponent(query)}${kind === 'end' ? currentSearchPoint : ''}`,
-      );
+      const result = await invokeFunction('place-search', {
+        body: {
+          query,
+          lng: kind === 'end' && startPlace ? startPlace.lng : undefined,
+          lat: kind === 'end' && startPlace ? startPlace.lat : undefined,
+        },
+      });
       if (kind === 'start') setStartResults(result.places ?? []);
       else setEndResults(result.places ?? []);
       setRouteState((result.places ?? []).length ? '지도에서 장소 선택' : '검색 결과 없음');
@@ -976,7 +994,7 @@ function App() {
     }
     setRouteState('조회 중');
     try {
-      const result = await apiRequest('/api/transit/estimate', { method: 'POST', body: JSON.stringify(payload) });
+      const result = await invokeFunction('route-estimate', { body: payload });
       const routes = result.routes ?? [];
       const shortest = routes[0];
       if (!shortest) { setRouteOptions([]); setRouteState('경로 없음'); return; }

@@ -1,0 +1,13 @@
+project_id = "timebomb"
+
+[functions.place-search]
+verify_jwt = false
+
+[functions.schedules]
+verify_jwt = false
+
+[functions.route-estimate]
+verify_jwt = false
+
+[functions.admin-dashboard]
+verify_jwt = false
