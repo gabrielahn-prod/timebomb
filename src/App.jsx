@@ -159,6 +159,23 @@ function canvasToBlob(canvas) {
   });
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function getBrowserHints() {
+  const ua = navigator.userAgent || '';
+  return {
+    isKakaoTalk: /KAKAOTALK/i.test(ua),
+    isIos: /iPad|iPhone|iPod/i.test(ua),
+  };
+}
+
 function formatDateTime(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -1171,9 +1188,11 @@ function App() {
         await navigator.share({ files: [file], title: 'Timebomb 알람 결과' });
         return;
       }
+      const browserHints = getBrowserHints();
+      const dataUrl = browserHints.isKakaoTalk && browserHints.isIos ? await blobToDataUrl(blob) : null;
       setShareImage((current) => {
         if (current?.url) URL.revokeObjectURL(current.url);
-        return { url: URL.createObjectURL(blob), name: file.name };
+        return { url: URL.createObjectURL(blob), dataUrl, name: file.name };
       });
       setSaveState('이미지 준비됨');
     } catch {
@@ -1184,9 +1203,12 @@ function App() {
   const downloadShareImage = () => {
     if (!shareImage?.url) return;
     const link = document.createElement('a');
-    link.href = shareImage.url;
+    link.href = shareImage.dataUrl || shareImage.url;
     link.download = shareImage.name;
+    link.style.display = 'none';
+    document.body.appendChild(link);
     link.click();
+    link.remove();
   };
 
   const closeShareImage = () => {
@@ -1800,11 +1822,11 @@ function App() {
                 <Download size={16} />
                 다운로드
               </button>
-              <a href={shareImage.url} target="_blank" rel="noreferrer">
+              <a href={shareImage.dataUrl || shareImage.url} target="_blank" rel="noreferrer">
                 새 창 열기
               </a>
             </div>
-            <p>카카오톡 안에서는 이미지를 길게 눌러 저장하거나 새 창에서 열어 저장하세요.</p>
+            <p>카카오톡 안에서 저장이 안 되면 이미지를 길게 누르거나 새 창에서 열어 저장하세요.</p>
           </section>
         </div>
       )}
